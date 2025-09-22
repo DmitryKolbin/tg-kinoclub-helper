@@ -282,40 +282,6 @@ async fn run_vote_flow(bot: &Bot, chat: ChatId, tmdb: &TmdbClient, storage: &Sto
     Ok(())
 }
 
-
-/* ====== Альбом (общий caption у первого элемента) ====== */
-async fn send_album(
-    bot: &teloxide::Bot,
-    chat_id: ChatId,
-    movies: &[Movie],
-    common_caption_html: Option<&str>,
-) -> Result<(), teloxide::RequestError> {
-    let mut media: Vec<InputMedia> = Vec::new();
-    for (i, m) in movies.iter().take(10).enumerate() {
-        if let Some(p) = &m.poster_path {
-            let url = format!("https://image.tmdb.org/t/p/w500{}", p);
-            if let Ok(bytes) = fetch_image(&url).await {
-                let file = InputFile::memory(bytes).file_name(format!("poster_{i}.jpg"));
-                if i == 0 {
-                    let mut first = InputMediaPhoto::new(file);
-                    if let Some(c) = common_caption_html {
-                        first.caption = Some(clip(c, 1024));
-                        first.show_caption_above_media = true;
-                        first.parse_mode = Some(ParseMode::Html);
-                    }
-                    media.push(InputMedia::Photo(first));
-                } else {
-                    media.push(InputMedia::Photo(InputMediaPhoto::new(file)));
-                }
-            }
-        }
-    }
-    if !media.is_empty() {
-        bot.send_media_group(chat_id, media).await?;
-    }
-    Ok(())
-}
-
 /* ====== Кнопки ====== */
 
 fn keyboard_add_results(results: &[Movie]) -> InlineKeyboardMarkup {
@@ -327,25 +293,12 @@ fn keyboard_add_results(results: &[Movie]) -> InlineKeyboardMarkup {
         row.push(btn);
         rows.push(row);
         row = Vec::new();
-        
+
     }
     if !row.is_empty() { rows.push(row); }
     InlineKeyboardMarkup::new(rows)
 }
 
-fn keyboard_list_two_columns(list: &[Movie]) -> InlineKeyboardMarkup {
-    // каждая строка: [Показать] [Удалить]
-    let mut rows = Vec::new();
-    for m in list {
-        let show = InlineKeyboardButton::callback(
-            format!("🎬 {}", one_line_title(m)),
-            format!("show:{}", m.id),
-        );
-        let del = InlineKeyboardButton::callback("🗑 Удалить".to_string(), format!("del:{}", m.id));
-        rows.push(vec![show, del]);
-    }
-    InlineKeyboardMarkup::new(rows)
-}
 
 /* ====== Вспомогательные ====== */
 
@@ -468,7 +421,7 @@ fn keyboard_list_two_columns_stored(list: &[StoredMovie]) -> InlineKeyboardMarku
             format!("🎬 {}", one_line_title_stored(m)),
             format!("show:{}", m.id),
         );
-        let del = InlineKeyboardButton::callback("🗑 Удалить".to_string(), format!("del:{}", m.id));
+        let del = InlineKeyboardButton::callback("🗑".to_string(), format!("del:{}", m.id));
         rows.push(vec![show, del]);
     }
     InlineKeyboardMarkup::new(rows)
@@ -491,6 +444,7 @@ async fn send_album_from_stored(
                     let mut first = InputMediaPhoto::new(file);
                     if let Some(c) = common_caption_html {
                         first.caption = Some(clip(c, 1024));
+                        first.show_caption_above_media = true;
                         first.parse_mode = Some(ParseMode::Html);
                     }
                     media.push(InputMedia::Photo(first));
