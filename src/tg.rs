@@ -40,7 +40,7 @@ enum Command {
     Help,
 }
 
-pub async fn run(bot: Bot, tmdb: TmdbClient, storage: Storage) {
+pub async fn run(bot: Bot, tmdb: TmdbClient, storage: Storage, anonymous: bool, multiple: bool) {
     let msg_handler = dptree::entry()
         .branch(
             Update::filter_message()
@@ -53,7 +53,7 @@ pub async fn run(bot: Bot, tmdb: TmdbClient, storage: Storage) {
                             move |bot: Bot, msg: Message, cmd: Command| {
                                 let tmdb = tmdb.clone();
                                 let storage = storage.clone();
-                                async move { on_command(bot, msg, cmd, &tmdb, &storage).await }
+                                async move { on_command(bot, msg, cmd, &tmdb, &storage, anonymous, multiple).await }
                             }
                         })
                 )
@@ -93,6 +93,8 @@ async fn on_command(
     cmd: Command,
     tmdb: &TmdbClient,
     storage: &Storage,
+    anonymous: bool,
+    multiple: bool,
 ) -> ResponseResult<()> {
     match cmd {
         Command::Help => {
@@ -104,7 +106,7 @@ async fn on_command(
             bot.send_message(msg.chat.id, "Список очищен.").await?;
         }
         Command::List => send_list_view(&bot, msg.chat.id, storage).await?,
-        Command::Vote => run_vote_flow(&bot, msg.chat.id, tmdb, storage).await?,
+        Command::Vote => run_vote_flow(&bot, msg.chat.id, tmdb, storage, anonymous, multiple).await?,
     }
     Ok(())
 }
@@ -243,7 +245,7 @@ async fn send_list_view(bot: &Bot, chat: ChatId, storage: &Storage) -> ResponseR
     Ok(())
 }
 
-async fn run_vote_flow(bot: &Bot, chat: ChatId, tmdb: &TmdbClient, storage: &Storage) -> ResponseResult<()> {
+async fn run_vote_flow(bot: &Bot, chat: ChatId, tmdb: &TmdbClient, storage: &Storage, anonymous:bool, multiple_ans: bool) -> ResponseResult<()> {
     let list = storage.get(chat.0).await;
     if list.len() < 2 {
         bot.send_message(chat, "Нужно минимум 2 фильма в списке. Добавь и повтори /vote.").await?;
@@ -252,7 +254,7 @@ async fn run_vote_flow(bot: &Bot, chat: ChatId, tmdb: &TmdbClient, storage: &Sto
     // опрос
     let options: Vec<teloxide::types::InputPollOption> =
         list.iter().map(|m| teloxide::types::InputPollOption::new(one_line_title_stored(m))).collect();
-    bot.send_poll(chat, "Что смотрим?", options).is_anonymous(false).await?;
+    bot.send_poll(chat, "Что смотрим?", options).is_anonymous(anonymous).allows_multiple_answers(multiple_ans).await?;
 
     // альбом постеров (короткий общий caption)
     send_album_from_stored(bot, chat, &list, Some("<b>Постеры</b>")).await?;

@@ -21,6 +21,6 @@ async fn main() -> anyhow::Result<()> {
     let store_path = std::env::var("STORE_PATH").unwrap_or_else(|_| "movie_bot_state.json".to_string());
     let storage = storage::Storage::new(store_path).await?;
 
-    tg::run(bot, tmdb, storage).await;
+    tg::run(bot, tmdb, storage, false, true).await;
     Ok(())
 }
