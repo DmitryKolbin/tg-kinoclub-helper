@@ -2,15 +2,23 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::fs;
 use tokio::sync::RwLock;
+use crate::tmdb::MediaKind;
+
+
+
+fn default_media_kind() -> MediaKind {
+    MediaKind::Movie
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMovie {
     pub id: u64,
     pub title: String,
     pub original_title: String,
+    #[serde(default = "default_media_kind")]
+    pub media_type: MediaKind,
     pub poster_path: Option<String>,
     pub release_date: Option<String>,
-    // overview хранить не обязательно; для показа детальной инфы всё равно тянем из TMDb
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

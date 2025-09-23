@@ -1,5 +1,5 @@
 use crate::storage::{Storage, StoredMovie};
-use crate::tmdb::{TmdbClient, Movie};
+use crate::tmdb::{TmdbClient, MultiNorm};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::{collections::{HashMap, HashSet}, sync::Arc};
@@ -13,13 +13,13 @@ use teloxide::{
     utils::command::BotCommands,
 };
 use tokio::sync::RwLock;
-
+use crate::tmdb;
 /* ====== Хранилище состояния ======
    selected: чат -> выбранные фильмы (макс 10)
    last_search: чат -> результаты последнего поиска (чтобы добавлять по кнопке) */
-static SELECTED: Lazy<Arc<RwLock<HashMap<ChatId, Vec<Movie>>>>> =
+static SELECTED: Lazy<Arc<RwLock<HashMap<ChatId, Vec<MultiNorm>>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
-static LAST_SEARCH: Lazy<Arc<RwLock<HashMap<ChatId, Vec<Movie>>>>> =
+static LAST_SEARCH: Lazy<Arc<RwLock<HashMap<ChatId, Vec<MultiNorm>>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 /* ====== Команды ====== */
@@ -176,10 +176,11 @@ async fn on_callback(
             if let Some(m) = movie_opt {
                 let added = storage.add_movie(chat_id.0, StoredMovie {
                     id: m.id,
-                    title: m.title.clone(),
-                    original_title: m.original_title.clone(),
-                    poster_path: m.poster_path.clone(),
+                    title: m.title,
+                    original_title: m.original_title,
+                    poster_path: m.image_path.clone(),
                     release_date: m.release_date.clone(),
+                    media_type: m.media_type.clone(),
                 }).await.map_err(to_req_err)?;
                 if added {
                     answer_cb(&bot, &q, "Добавлено").await?;
@@ -211,7 +212,7 @@ async fn on_callback(
             if let Some(m) = tmdb.movie_details_ru(id).await.map_err(to_req_err)? {
                 let text = make_block(&m, 2000);
                 bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await?;
-                if let Some(p) = &m.poster_path {
+                if let Some(p) = &m.image_path {
                     let url = format!("https://image.tmdb.org/t/p/w500{}", p);
                     if let Ok(bytes) = fetch_image(&url).await {
                         bot.send_photo(chat_id, InputFile::memory(bytes).file_name(format!("poster_{}.jpg", m.id))).await?;
@@ -263,12 +264,30 @@ async fn run_vote_flow(bot: &Bot, chat: ChatId, tmdb: &TmdbClient, storage: &Sto
     let mut blocks = Vec::new();
     let mut trailer_lines = Vec::new();
     for sm in &list {
-        if let Some(m) = tmdb.movie_details_ru(sm.id).await.map_err(to_req_err)? {
-            let trailer = tmdb.best_trailer_url(m.id).await.map_err(to_req_err).ok().flatten();
-            if let Some(t) = trailer.as_ref() {
-                trailer_lines.push(format!("• <b>{}</b>: {}", html_escape(&m.title), html_escape(t)));
-            }
-            blocks.push(make_block(&m, 1200));
+        match sm.media_type {
+            tmdb::MediaKind::Movie => {
+                if let Some(m) = tmdb.movie_details_ru(sm.id).await.map_err(to_req_err)? {
+                    let trailer = tmdb.best_trailer_url(m.id).await.map_err(to_req_err).ok().flatten();
+
+                    if let Some(t) = trailer.as_ref() {
+                        trailer_lines.push(format!("• <b>{}</b>: {}", html_escape(&m.title), html_escape(t)));
+                    }
+                    blocks.push(make_block(&m, 1200));
+                }
+            },
+            tmdb::MediaKind::Tv => {
+                if let Some(m) = tmdb.tv_details_ru(sm.id).await.map_err(to_req_err)? {
+                    let trailer = tmdb.best_tv_trailer_url(m.id).await.map_err(to_req_err).ok().flatten();
+
+                    if let Some(t) = trailer.as_ref() {
+                        trailer_lines.push(format!("• <b>{}</b>: {}", html_escape(&m.title), html_escape(t)));
+                    }
+                    blocks.push(make_block(&m, 1200));
+                }
+            },
+            tmdb::MediaKind::Person => {
+                // пропускаем
+            },
         }
     }
     let text = join_blocks(blocks, 4000 - 50);
@@ -286,7 +305,7 @@ async fn run_vote_flow(bot: &Bot, chat: ChatId, tmdb: &TmdbClient, storage: &Sto
 
 /* ====== Кнопки ====== */
 
-fn keyboard_add_results(results: &[Movie]) -> InlineKeyboardMarkup {
+fn keyboard_add_results(results: &[MultiNorm]) -> InlineKeyboardMarkup {
     // по 1 в строке
     let mut rows = Vec::new();
     let mut row = Vec::new();
@@ -304,7 +323,7 @@ fn keyboard_add_results(results: &[Movie]) -> InlineKeyboardMarkup {
 
 /* ====== Вспомогательные ====== */
 
-fn one_line_title(m: &Movie) -> String {
+fn one_line_title(m: &MultiNorm) -> String {
     if let Some(y) = m.release_date.as_ref().and_then(|d| d.get(..4)) {
         format!("{} ({})", m.title, y)
     } else {
@@ -312,7 +331,7 @@ fn one_line_title(m: &Movie) -> String {
     }
 }
 
-fn make_block(m: &Movie, overview_limit: usize) -> String {
+fn make_block(m: &MultiNorm, overview_limit: usize) -> String {
     let year = m.release_date.as_ref().and_then(|d| d.get(..4)).unwrap_or("");
     let title = html_escape(&m.title);
     let mut body = if m.overview.trim().is_empty() {
@@ -451,7 +470,7 @@ async fn send_album_from_stored(
                     }
                     media.push(InputMedia::Photo(first));
                 } else {
-                    media.push(InputMedia::Photo(InputMediaPhoto::new(file)));
+                    media.push(InputMedia::Photo(InputMediaPhoto::new(file).show_caption_above_media(true)));
                 }
             }
         }
