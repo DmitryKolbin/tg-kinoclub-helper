@@ -123,7 +123,14 @@ async fn on_search_text(
     if query.is_empty() { return Ok(()); }
 
     // Ищем до 10
-    let results = tmdb.search_movies_ru(query, 10).await.map_err(to_req_err)?;
+    let results = match tmdb.search_movies_ru(query, 10).await {
+        Ok(v) => v,
+        Err(e) => {
+            bot.send_message(msg.chat.id, e.user_msg()).await?;
+            return Ok(());
+        }
+    };
+
     if results.is_empty() {
         bot.send_message(msg.chat.id, "Ничего не нашёл 😕").await?;
         return Ok(());
@@ -162,10 +169,19 @@ async fn on_callback(
 ) -> ResponseResult<()> {
     let Some(data) = q.data.clone() else { return Ok(()); };
     let chat_id = q.message.as_ref().map(|m| m.chat().id).unwrap_or(ChatId(0));
-    let mut parts = data.splitn(2, ':');
+    let mut parts = data.splitn(3, ':');
     let cmd = parts.next().unwrap_or("");
     let id_str = parts.next().unwrap_or("");
+    let media_type_str = parts.next().unwrap_or("");
     let Ok(id) = id_str.parse::<u64>() else { return Ok(()); };
+    
+    let media_type = if media_type_str == "tv" {
+        tmdb::MediaKind::Tv
+    } else if media_type_str == "person" {
+        tmdb::MediaKind::Person
+    } else {
+        tmdb::MediaKind::Movie
+    };
 
     match cmd {
         "add" => {
@@ -200,7 +216,7 @@ async fn on_callback(
             }
         }
         "del" => {
-            let removed = storage.delete_movie(chat_id.0, id).await.map_err(to_req_err)?;
+            let removed = storage.delete_movie(chat_id.0, id, media_type).await.map_err(to_req_err)?;
             if removed {
                 answer_cb(&bot, &q, "Удалено").await?;
                 send_list_view(&bot, chat_id, storage).await?;
@@ -209,18 +225,26 @@ async fn on_callback(
             }
         }
         "show" => {
-            if let Some(m) = tmdb.movie_details_ru(id).await.map_err(to_req_err)? {
-                let text = make_block(&m, 2000);
-                bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await?;
-                if let Some(p) = &m.image_path {
-                    let url = format!("https://image.tmdb.org/t/p/w500{}", p);
-                    if let Ok(bytes) = fetch_image(&url).await {
-                        bot.send_photo(chat_id, InputFile::memory(bytes).file_name(format!("poster_{}.jpg", m.id))).await?;
+            match tmdb.movie_details_ru(id, media_type).await {
+                Ok(Some(m)) => {
+                    let text = make_block(&m, 2000);
+                    bot.send_message(chat_id, text).parse_mode(ParseMode::Html).await?;
+                    if let Some(p) = &m.image_path {
+                        let url = format!("https://image.tmdb.org/t/p/w500{}", p);
+                        if let Ok(bytes) = fetch_image(&url).await {
+                            bot.send_photo(chat_id, InputFile::memory(bytes).file_name(format!("poster_{}.jpg", m.id))).await?;
+                        }
                     }
+                    answer_cb(&bot, &q, "Показал").await?;
+                },
+                Ok(None) => {
+                    answer_cb(&bot, &q, "Фильм не найден").await?;
+                    return Ok(());
+                },
+                Err(e) => {
+                    answer_cb(&bot, &q, e.user_msg()).await?;
+                    return Ok(());
                 }
-                answer_cb(&bot, &q, "Показал").await?;
-            } else {
-                answer_cb(&bot, &q, "Не удалось получить данные").await?;
             }
         }
         _ => { answer_cb(&bot, &q, "Неизвестная команда").await?; }
@@ -266,8 +290,8 @@ async fn run_vote_flow(bot: &Bot, chat: ChatId, tmdb: &TmdbClient, storage: &Sto
     for sm in &list {
         match sm.media_type {
             tmdb::MediaKind::Movie => {
-                if let Some(m) = tmdb.movie_details_ru(sm.id).await.map_err(to_req_err)? {
-                    let trailer = tmdb.best_trailer_url(m.id).await.map_err(to_req_err).ok().flatten();
+                if let Some(m) = tmdb.movie_details_ru(sm.id, sm.media_type).await.map_err(to_req_err)? {
+                    let trailer = tmdb.best_trailer_url(m.clone()).await.map_err(to_req_err).ok().flatten();
 
                     if let Some(t) = trailer.as_ref() {
                         trailer_lines.push(format!("• <b>{}</b>: {}", html_escape(&m.title), html_escape(t)));
@@ -276,8 +300,8 @@ async fn run_vote_flow(bot: &Bot, chat: ChatId, tmdb: &TmdbClient, storage: &Sto
                 }
             },
             tmdb::MediaKind::Tv => {
-                if let Some(m) = tmdb.tv_details_ru(sm.id).await.map_err(to_req_err)? {
-                    let trailer = tmdb.best_tv_trailer_url(m.id).await.map_err(to_req_err).ok().flatten();
+                if let Some(m) = tmdb.movie_details_ru(sm.id, sm.media_type).await.map_err(to_req_err)? {
+                    let trailer = tmdb.best_trailer_url(m.clone()).await.map_err(to_req_err).ok().flatten();
 
                     if let Some(t) = trailer.as_ref() {
                         trailer_lines.push(format!("• <b>{}</b>: {}", html_escape(&m.title), html_escape(t)));
@@ -440,9 +464,9 @@ fn keyboard_list_two_columns_stored(list: &[StoredMovie]) -> InlineKeyboardMarku
     for m in list {
         let show = InlineKeyboardButton::callback(
             format!("🎬 {}", one_line_title_stored(m)),
-            format!("show:{}", m.id),
+            format!("show:{}:{}", m.id, m.media_type.as_str()),
         );
-        let del = InlineKeyboardButton::callback("🗑".to_string(), format!("del:{}", m.id));
+        let del = InlineKeyboardButton::callback("🗑".to_string(), format!("del:{}:{}", m.id, m.media_type.as_str()));
         rows.push(vec![show, del]);
     }
     InlineKeyboardMarkup::new(rows)

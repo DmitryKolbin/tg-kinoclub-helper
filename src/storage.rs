@@ -80,7 +80,7 @@ impl Storage {
         {
             let mut guard = self.inner.write().await;
             let entry = guard.chats.entry(chat_id).or_default();
-            if entry.iter().any(|x| x.id == m.id) {
+            if entry.iter().any(|x| x.id == m.id && x.media_type == m.media_type) {
                 added = false;
             } else if entry.len() >= 10 {
                 added = false;
@@ -93,13 +93,13 @@ impl Storage {
         Ok(added)
     }
 
-    pub async fn delete_movie(&self, chat_id: i64, movie_id: u64) -> anyhow::Result<bool> {
+    pub async fn delete_movie(&self, chat_id: i64, movie_id: u64, media_kind: MediaKind) -> anyhow::Result<bool> {
         let mut removed = false;
         {
             let mut guard = self.inner.write().await;
             if let Some(list) = guard.chats.get_mut(&chat_id) {
                 let before = list.len();
-                list.retain(|m| m.id != movie_id);
+                list.retain(|m| !(m.id == movie_id && m.media_type == media_kind));
                 removed = list.len() < before;
             }
         }

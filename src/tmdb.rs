@@ -1,119 +1,222 @@
-use reqwest::Client;
+use std::cmp::PartialEq;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use thiserror::Error;
+use tokio::time::{sleep, Duration};
+
+#[derive(Debug, Error)]
+pub enum TmdbErr {
+    #[error("TMDb: недоступно (сетевой таймаут/ошибка).")]
+    Net,
+    #[error("TMDb: превышен лимит запросов (429). Подождите немного.")]
+    RateLimited,
+    #[error("TMDb: неверный ключ API (401). Проверьте TMDB_API_KEY.")]
+    Auth,
+    #[error("TMDb: доступ запрещён (403).")]
+    Forbidden,
+    #[error("TMDb: не найдено (404).")]
+    NotFound,
+    #[error("TMDb: внутренняя ошибка ({0}).")]
+    Server(u16),
+    #[error("TMDb: неожиданный статус ({0}).")]
+    Unexpected(u16),
+}
+
+impl TmdbErr {
+    pub fn user_msg(&self) -> &'static str {
+        match self {
+            TmdbErr::Net => "TMDb сейчас не отвечает. Попробуйте ещё раз через минуту.",
+            TmdbErr::RateLimited => "Слишком часто спрашиваем TMDb. Подождите немного и повторите.",
+            TmdbErr::Auth => "Неверный TMDB_API_KEY на сервере бота. Сообщите администратору.",
+            TmdbErr::Forbidden => "TMDb отклонил запрос (403). Попробуйте другой фильм.",
+            TmdbErr::NotFound => "Ничего не нашлось в TMDb.",
+            TmdbErr::Server(_) => "TMDb временно недоступен. Повторите позже.",
+            TmdbErr::Unexpected(_) => "Неожиданный ответ TMDb. Попробуйте ещё раз.",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct TmdbClient {
-    api_key: String,
+    bearer_token: String,
     http: Client,
 }
 
+impl PartialEq for MediaKind {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((self, other),
+            (MediaKind::Movie, MediaKind::Movie) |
+            (MediaKind::Tv, MediaKind::Tv) |
+            (MediaKind::Person, MediaKind::Person)
+        )
+    }
+}
+
 impl TmdbClient {
-    pub fn new(api_key: String) -> Self {
-        Self { api_key, http: Client::new() }
+    pub fn new(bearer_token: String) -> Self {
+        let http = Client::builder()
+            .timeout(Duration::from_secs(12))
+            .user_agent("tg-movie-bot/1.0 (+teloxide)")
+            .build()
+            .expect("reqwest client");
+        Self { bearer_token, http }
+    }
+
+    // Обобщённая загрузка + JSON с ретраями (для 5xx/429/сетевых)
+    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, TmdbErr> {
+        // 3 попытки, бэкофф 300/800/1500 мс
+        let mut delays = [300u64, 800, 1500].into_iter();
+        loop {
+            let req = self.http
+                .get(url)
+                .bearer_auth(&self.bearer_token); // 👈 тут
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(_) => {
+                    if let Some(ms) = delays.next() {
+                        sleep(Duration::from_millis(ms)).await;
+                        continue;
+                    } else {
+                        return Err(TmdbErr::Net);
+                    }
+                }
+            };
+
+            match resp.status() {
+                StatusCode::OK => {
+                    let v = resp.json::<T>().await.map_err(|_| TmdbErr::Net)?;
+                    return Ok(v);
+                }
+                StatusCode::TOO_MANY_REQUESTS => {
+                    if let Some(ms) = delays.next() {
+                        sleep(Duration::from_millis(ms)).await;
+                        continue;
+                    } else {
+                        return Err(TmdbErr::RateLimited);
+                    }
+                }
+                StatusCode::UNAUTHORIZED => return Err(TmdbErr::Auth),
+                StatusCode::FORBIDDEN => return Err(TmdbErr::Forbidden),
+                StatusCode::NOT_FOUND => return Err(TmdbErr::NotFound),
+                s if s.is_server_error() => {
+                    if let Some(ms) = delays.next() {
+                        sleep(Duration::from_millis(ms)).await;
+                        continue;
+                    } else {
+                        return Err(TmdbErr::Server(s.as_u16()));
+                    }
+                }
+                s => return Err(TmdbErr::Unexpected(s.as_u16())),
+            }
+        }
     }
 
     /// Поиск фильмов (RU), максимум `limit` (1..10).
-    pub async fn search_movies_ru(&self, query: &str, limit: usize) -> reqwest::Result<Vec<MultiNorm>> {
+    pub async fn search_movies_ru(&self, query: &str, limit: usize) -> Result<Vec<MultiNorm>, TmdbErr> {
         let url = format!(
             "https://api.themoviedb.org/3/search/multi?query={}&language=ru-RU&include_adult=false&page=1",
             urlencoding::encode(query)
         );
-        let resp = self.http.get(url).bearer_auth(self.api_key.to_string()).send().await?;
-        if !resp.status().is_success() {
-            return Ok(vec![]);
-        }
 
-        let data: SearchResp<SearchMultiDto> = resp.json().await?;
+        let data: SearchResp<SearchMultiDto> = self.get_json(&url).await?;
 
-        let items: Vec<MultiNorm> = data.results
+        let items = data
+            .results
             .into_iter()
             .filter(|item| matches!(item, SearchMultiDto::Movie { .. } | SearchMultiDto::Tv { .. }))
+            .map(Into::into) // -> MultiNorm
             .take(limit)
-            .map(Into::into)
             .collect();
-        
+
         Ok(items)
     }
 
     /// Детали фильма (RU) — чтобы «показать описание и постер» в списке.
-    pub async fn movie_details_ru(&self, id: u64) -> reqwest::Result<Option<MultiNorm>> {
+    pub async fn movie_details_ru(&self, id: u64, media_type: MediaKind) -> Result<Option<MultiNorm>, TmdbErr> {
+        let section = match media_type {
+            MediaKind::Movie => "movie",
+            MediaKind::Tv => "tv",
+            MediaKind::Person => return Ok(None), // у персоны нет трейлеров
+        };
+
+
         let url = format!(
-            "https://api.themoviedb.org/3/movie/{}?language=ru-RU",
+            "https://api.themoviedb.org/3/{}/{}?language=ru-RU",
+            section,
             id
         );
-        let resp = self.http.get(url).bearer_auth(self.api_key.to_string()).send().await?;
-        if !resp.status().is_success() {
-            return Ok(None);
-        }
-        let m: MovieDetailsDto = resp.json().await?;
-        Ok(Some(m.into()))
-    }
-    
-    //Детали сериала (RU) — чтобы «показать описание и постер» в списке.
-    pub async fn tv_details_ru(&self, id: u64) -> reqwest::Result<Option<MultiNorm>> {
-        let url = format!(
-            "https://api.themoviedb.org/3/tv/{}?language=ru-RU",
-            id
-        );
-        let resp = self.http.get(url).bearer_auth(self.api_key.to_string()).send().await?;
-        if !resp.status().is_success() {
-            return Ok(None);
-        }
-        let m: TvDetailsDto = resp.json().await?;
-        Ok(Some(m.into()))
+
+        let res = match media_type {
+            MediaKind::Movie => {
+                let data: MovieDetailsDto = self.get_json(&url).await?;
+                data.into()
+            }
+            MediaKind::Tv => {
+                let data: TvDetailsDto = self.get_json(&url).await?;
+                data.into()
+            } 
+            MediaKind::Person => return Ok(None),
+        };
+        
+        Ok(Some(res) )
     }
 
     /// Лучший трейлер (YouTube), RU→EN
-    pub async fn best_trailer_url(&self, movie_id: u64) -> reqwest::Result<Option<String>> {
+    pub async fn best_trailer_url(&self, video: MultiNorm) -> Result<Option<String>, TmdbErr> {
         let mut all: Vec<Video> = Vec::new();
+        let mut any_ok = false;
+        let mut last_err: Option<TmdbErr> = None;
+
+        let section = match video.media_type {
+            MediaKind::Movie => "movie",
+            MediaKind::Tv => "tv",
+            MediaKind::Person => return Ok(None), // у персоны нет трейлеров
+        };
         for lang in ["ru-RU", "en-US"] {
             let url = format!(
-                "https://api.themoviedb.org/3/movie/{}/videos?language={}",
-                movie_id, lang
+                "https://api.themoviedb.org/3/{}/{}/videos?language={}",
+                section,
+                video.id, lang
             );
-            let resp = self.http.get(url).bearer_auth(self.api_key.to_string()).send().await?;
-            if resp.status().is_success() {
-                let mut v: VideosResp = resp.json().await?;
-                all.append(&mut v.results);
+
+            match self.get_json::<VideosResp>(&url).await {
+                Ok(mut v) => {
+                    any_ok = true;
+                    all.append(&mut v.results);
+                }
+                Err(e) => {
+                    // запомним ошибку, но попробуем следующий язык
+                    last_err = Some(e);
+                }
             }
         }
-        let mut candidates: Vec<&Video> = all.iter()
-            .filter(|v| v.site.eq_ignore_ascii_case("YouTube"))
-            .collect();
-        candidates.sort_by_key(|v| {
-            let official = if v.official.unwrap_or(false) { 0 } else { 1 };
-            let typ = match v.r#type.as_str() { "Trailer" => 0, "Teaser" => 1, _ => 2 };
-            (official, typ)
-        });
-        Ok(candidates.first().map(|v| format!("https://www.youtube.com/watch?v={}", v.key)))
-    }
-    
-    /// Лучший трейлер сериала (YouTube), RU→EN
-    pub async fn best_tv_trailer_url(&self, tv_id: u64) -> reqwest::Result<Option<String>> {
-        let mut all: Vec<Video> = Vec::new();
-        for lang in ["ru-RU", "en-US"] {
-            let url = format!(
-                "https://api.themoviedb.org/3/tv/{}/videos?language={}",
-                tv_id, lang
-            );
-            let resp = self.http.get(url).bearer_auth(self.api_key.to_string()).send().await?;
-            if resp.status().is_success() {
-                let mut v: VideosResp = resp.json().await?;
-                all.append(&mut v.results);
-            }
+        // Если оба запроса провалились — отдаём ошибку пользователю/в верхний слой
+        if !any_ok {
+            return Err(last_err.unwrap_or(TmdbErr::Net));
         }
-        let mut candidates: Vec<&Video> = all.iter()
+
+        // Фильтруем и сортируем кандидатов
+        let mut candidates: Vec<&Video> = all
+            .iter()
             .filter(|v| v.site.eq_ignore_ascii_case("YouTube"))
             .collect();
+
         candidates.sort_by_key(|v| {
             let official = if v.official.unwrap_or(false) { 0 } else { 1 };
-            let typ = match v.r#type.as_str() { "Trailer" => 0, "Teaser" => 1, _ => 2 };
+            let typ = match v.r#type.as_str() {
+                "Trailer" => 0,
+                "Teaser" => 1,
+                _ => 2,
+            };
             (official, typ)
         });
-        Ok(candidates.first().map(|v| format!("https://www.youtube.com/watch?v={}", v.key)))
+
+        Ok(candidates
+            .first()
+            .map(|v| format!("https://www.youtube.com/watch?v={}", v.key)))
     }
 }
-
 /* ======= DTOs ======= */
 
 
@@ -208,6 +311,15 @@ pub enum MediaKind {
     Person,
 }
 
+impl MediaKind {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            MediaKind::Movie => "movie",
+            MediaKind::Tv => "tv",
+            MediaKind::Person => "person",
+        }
+    }
+}
 /* Mapping to internal model */
 
 impl From<SearchMultiDto> for MultiNorm {
