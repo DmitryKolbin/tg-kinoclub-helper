@@ -1,6 +1,6 @@
-mod tmdb;
-mod tg;
 mod storage;
+mod tg;
+mod tmdb;
 
 use dotenvy::dotenv;
 use teloxide::prelude::*;
@@ -18,7 +18,8 @@ async fn main() -> anyhow::Result<()> {
     let tmdb = tmdb::TmdbClient::new(tmdb_key);
 
     // путь к файлу хранения (можно через ENV)
-    let store_path = std::env::var("STORE_PATH").unwrap_or_else(|_| "movie_bot_state.json".to_string());
+    let store_path =
+        std::env::var("STORE_PATH").unwrap_or_else(|_| "movie_bot_state.json".to_string());
     let storage = storage::Storage::new(store_path).await?;
 
     tg::run(bot, tmdb, storage, false, true).await;
