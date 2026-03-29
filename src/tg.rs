@@ -2,7 +2,7 @@ use crate::storage::{Storage, StoredMovie};
 use crate::tmdb;
 use crate::tmdb::{MultiNorm, TmdbClient};
 use once_cell::sync::Lazy;
-use std::{collections::HashMap, sync::Arc};
+
 use teloxide::types::Message;
 use teloxide::{
     dispatching::{Dispatcher, UpdateFilterExt},
@@ -14,12 +14,17 @@ use teloxide::{
     utils::command::BotCommands,
     RequestError,
 };
-use tokio::sync::RwLock;
+use moka::future::Cache;
 /* ====== Хранилище состояния ======
-   last_search: чат -> результаты последнего поиска (чтобы добавлять по кнопке) */
+   last_search: (чат, ID сообщения бота) -> результаты поиска */
 #[allow(clippy::type_complexity)]
-static LAST_SEARCH: Lazy<Arc<RwLock<HashMap<ChatId, Vec<MultiNorm>>>>> =
-    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+static LAST_SEARCH: Lazy<Cache<(ChatId, i32), Vec<MultiNorm>>> =
+    Lazy::new(|| {
+        Cache::builder()
+            .time_to_live(std::time::Duration::from_secs(24 * 60 * 60))
+            .max_capacity(10_000)
+            .build()
+    });
 
 /* ====== Команды ====== */
 #[derive(BotCommands, Clone)]
@@ -94,6 +99,10 @@ async fn on_command<R>(
 where
     R: Requester<Err = RequestError>,
 {
+    if !msg.chat.is_private() {
+        return Ok(());
+    }
+
     match cmd {
         Command::Help => {
             bot.send_message(msg.chat.id, Command::descriptions().to_string())
@@ -104,7 +113,6 @@ where
                 .remove_chat(msg.chat.id.0)
                 .await
                 .map_err(to_req_err)?;
-            LAST_SEARCH.write().await.remove(&msg.chat.id);
             bot.send_message(msg.chat.id, "Список очищен.").await?;
         }
         Command::List => send_list_view(&bot, msg.chat.id, storage).await?,
@@ -125,6 +133,10 @@ async fn on_search_text<R>(
 where
     R: Requester<Err = RequestError>,
 {
+    if !msg.chat.is_private() {
+        return Ok(());
+    }
+
     let Some(query) = message_text_any(&msg) else {
         return Ok(());
     };
@@ -147,11 +159,6 @@ where
         return Ok(());
     }
 
-    // Сохраним последний поиск (чтобы по кнопке "➕ Добавить" знать, что именно добавлять)
-    LAST_SEARCH
-        .write()
-        .await
-        .insert(msg.chat.id, results.clone());
 
     // Сообщение с названиями + краткими описаниями
     let mut blocks = Vec::new();
@@ -165,9 +172,13 @@ where
 
     // Кнопки "➕ <Название (год)>"
     let kb = keyboard_add_results(&results);
-    bot.send_message(msg.chat.id, "Выбери фильм, чтобы добавить в список:")
+    let sent_msg = bot.send_message(msg.chat.id, "Выбери фильм, чтобы добавить в список:")
         .reply_markup(kb)
         .await?;
+
+    LAST_SEARCH
+        .insert((msg.chat.id, sent_msg.id.0), results)
+        .await;
 
     Ok(())
 }
@@ -208,12 +219,18 @@ where
 
     match cmd {
         "add" => {
-            let movie_opt = {
-                let map = LAST_SEARCH.read().await;
-                map.get(&chat_id)
-                    .and_then(|v| v.iter().find(|m| m.id == id))
-                    .cloned()
-            };
+            let message_id = q.message.as_ref().map(|m| m.id().0).unwrap_or(0);
+            let mut movie_opt = LAST_SEARCH
+                .get(&(chat_id, message_id))
+                .await
+                .and_then(|v| v.iter().find(|m| m.id == id).cloned());
+
+            if movie_opt.is_none() {
+                if let Ok(Some(m)) = tmdb.movie_details_ru(id, media_type).await {
+                    movie_opt = Some(m);
+                }
+            }
+
             if let Some(m) = movie_opt {
                 let added = storage
                     .add_movie(
@@ -633,7 +650,6 @@ mod tests {
     #[tokio::test]
     async fn test_on_search_text_updates_last_search() {
         let server = MockServer::start().await;
-        // Mock Telegram API response for send_message
         Mock::given(method("POST"))
             .and(path_regex(".*"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -648,17 +664,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        std::env::set_var("TELOXIDE_API_URL", server.uri());
-        std::env::set_var(
-            "TELOXIDE_TOKEN",
-            "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
-        );
-        let bot = Bot::from_env();
+        let bot = Bot::new("token").set_api_url(server.uri().parse().unwrap());
 
         let tmdb_server = MockServer::start().await;
         let tmdb = TmdbClient::new_test("token".to_string(), tmdb_server.uri());
 
-        // Mock TMDB response
         let tmdb_response = serde_json::json!({
             "page": 1,
             "total_pages": 1,
@@ -689,13 +699,11 @@ mod tests {
             "date": 1,
             "chat": {"id": 123, "type": "private", "first_name": "test"},
             "text": "test search"
-        }))
-        .unwrap();
+        })).unwrap();
 
         on_search_text(bot, msg, &tmdb, &storage).await.unwrap();
 
-        let last_search = LAST_SEARCH.read().await;
-        let results = last_search.get(&ChatId(123)).unwrap();
+        let results = LAST_SEARCH.get(&(ChatId(123), 1)).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Mock Movie");
     }
@@ -703,7 +711,6 @@ mod tests {
     #[tokio::test]
     async fn test_full_flow_search_and_add() {
         let server = MockServer::start().await;
-        // Mock for sendMessage
         Mock::given(method("POST"))
             .and(path_regex(".*Message"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -718,7 +725,6 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Mock for answerCallbackQuery
         Mock::given(method("POST"))
             .and(path_regex(".*Query"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -728,17 +734,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        std::env::set_var("TELOXIDE_API_URL", server.uri());
-        std::env::set_var(
-            "TELOXIDE_TOKEN",
-            "456456:ABC-DEF4564ghIkl-zyx57W2v1u456ew11",
-        );
-        let bot = Bot::from_env();
+        let bot = Bot::new("token").set_api_url(server.uri().parse().unwrap());
 
         let tmdb_server = MockServer::start().await;
         let tmdb = TmdbClient::new_test("token".to_string(), tmdb_server.uri());
 
-        // Mock TMDB response for search
         Mock::given(method("GET"))
             .and(wiremock::matchers::path("/search/multi"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -764,50 +764,260 @@ mod tests {
         let _ = std::fs::remove_file(&storage_path);
         let storage = Storage::new(storage_path.clone()).await.unwrap();
 
-        // 1. Simulate user searching for a movie
         let search_msg = serde_json::from_value::<Message>(serde_json::json!({
             "message_id": 1,
             "date": 1,
             "chat": {"id": 456, "type": "private", "first_name": "test"},
             "text": "integration"
-        }))
-        .unwrap();
+        })).unwrap();
 
-        on_search_text(bot.clone(), search_msg, &tmdb, &storage)
-            .await
-            .unwrap();
+        on_search_text(bot.clone(), search_msg, &tmdb, &storage).await.unwrap();
 
-        // Verify LAST_SEARCH is updated
         {
-            let last_search = LAST_SEARCH.read().await;
-            assert_eq!(last_search.get(&ChatId(456)).unwrap()[0].id, 456);
+            let results = LAST_SEARCH.get(&(ChatId(456), 1)).await.unwrap();
+            assert_eq!(results[0].id, 456);
         }
 
-        // 2. Simulate user clicking "Add" button
         let q = serde_json::from_value::<CallbackQuery>(serde_json::json!({
             "id": "1",
             "from": {"id": 456, "is_bot": false, "first_name": "test"},
             "chat_instance": "1",
             "data": "add:456:movie",
             "message": {
-                "message_id": 2,
+                "message_id": 1,
                 "date": 2,
                 "chat": {"id": 456, "type": "private", "first_name": "test"},
                 "text": "results"
             }
-        }))
-        .unwrap();
+        })).unwrap();
 
         on_callback(bot, q, &tmdb, &storage).await.unwrap();
 
-        // 3. Verify movie is in storage
         let stored = storage.get(456).await;
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].title, "Integration Movie");
 
         let _ = std::fs::remove_file(storage_path);
     }
+
+    #[tokio::test]
+    async fn test_on_search_text_ignores_group_chats() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(".*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 1,
+                    "date": 1,
+                    "chat": {"id": -10012345, "type": "group", "title": "group"},
+                    "text": "test"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let bot = Bot::new("token").set_api_url(server.uri().parse().unwrap());
+
+        let tmdb_server = MockServer::start().await;
+        let tmdb = TmdbClient::new_test("token".to_string(), tmdb_server.uri());
+
+        let tmdb_response = serde_json::json!({
+            "page": 1, "total_pages": 1, "total_results": 1,
+            "results": [{
+                "media_type": "movie", "id": 1, "title": "Mock Movie",
+                "original_title": "Mock Movie", "overview": "Overview",
+                "poster_path": "/path.jpg", "release_date": "2023-01-01"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/search/multi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tmdb_response))
+            .mount(&tmdb_server)
+            .await;
+
+        let storage_path = PathBuf::from("tests/data/tg_test_storage_group.json");
+        let storage = Storage::new(storage_path.clone()).await.unwrap();
+
+        let msg = serde_json::from_value::<Message>(serde_json::json!({
+            "message_id": 1,
+            "date": 1,
+            "chat": {"id": -10012345, "type": "group", "title": "group"},
+            "text": "test search"
+        })).unwrap();
+
+        on_search_text(bot, msg, &tmdb, &storage).await.unwrap();
+
+        let results = LAST_SEARCH.get(&(ChatId(-10012345), 1)).await;
+        assert!(results.is_none());
+        
+        let _ = std::fs::remove_file(storage_path);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_searches_in_same_chat() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(".*Message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 12,
+                    "date": 1,
+                    "chat": {"id": 777, "type": "private", "first_name": "test"},
+                    "text": "results 1"
+                }
+            })))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(".*Message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 22,
+                    "date": 2,
+                    "chat": {"id": 777, "type": "private", "first_name": "test"},
+                    "text": "results 2"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(".*Query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        let bot = Bot::new("token").set_api_url(server.uri().parse().unwrap());
+
+        let tmdb_server = MockServer::start().await;
+        let tmdb = TmdbClient::new_test("token".to_string(), tmdb_server.uri());
+
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path("/search/multi"))
+            .and(wiremock::matchers::query_param("query", "movie1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "page": 1, "total_pages": 1, "total_results": 1,
+                "results": [{
+                    "media_type": "movie", "id": 100, "title": "Movie 1",
+                    "original_title": "Movie 1", "overview": "", "poster_path": null, "release_date": "2001-01-01"
+                }]
+            })))
+            .mount(&tmdb_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path("/search/multi"))
+            .and(wiremock::matchers::query_param("query", "movie2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "page": 1, "total_pages": 1, "total_results": 1,
+                "results": [{
+                    "media_type": "movie", "id": 200, "title": "Movie 2",
+                    "original_title": "Movie 2", "overview": "", "poster_path": null, "release_date": "2002-02-02"
+                }]
+            })))
+            .mount(&tmdb_server)
+            .await;
+
+        let storage_path = PathBuf::from("tests/data/tg_test_storage_multiple.json");
+        let _ = std::fs::remove_file(&storage_path);
+        let storage = Storage::new(storage_path.clone()).await.unwrap();
+
+        let search_msg1 = serde_json::from_value::<Message>(serde_json::json!({
+            "message_id": 1, "date": 1, "chat": {"id": 777, "type": "private"}, "text": "movie1"
+        })).unwrap();
+        on_search_text(bot.clone(), search_msg1, &tmdb, &storage).await.unwrap();
+
+        let search_msg2 = serde_json::from_value::<Message>(serde_json::json!({
+            "message_id": 2, "date": 2, "chat": {"id": 777, "type": "private"}, "text": "movie2"
+        })).unwrap();
+        on_search_text(bot.clone(), search_msg2, &tmdb, &storage).await.unwrap();
+
+        let q1 = serde_json::from_value::<CallbackQuery>(serde_json::json!({
+            "id": "1", "from": {"id": 777, "is_bot": false, "first_name": "test"},
+            "chat_instance": "1", "data": "add:100:movie",
+            "message": {
+                "message_id": 12, "date": 1, "chat": {"id": 777, "type": "private"}, "text": "results 1"
+            }
+        })).unwrap();
+        on_callback(bot.clone(), q1, &tmdb, &storage).await.unwrap();
+
+        let stored = storage.get(777).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].title, "Movie 1");
+
+        let _ = std::fs::remove_file(storage_path);
+    }
+
+    #[tokio::test]
+    async fn test_tmdb_fallback_on_cache_miss() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(".*Query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": true
+            })))
+            .mount(&server)
+            .await;
+            
+        Mock::given(method("POST"))
+            .and(path_regex(".*Message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 2,
+                    "date": 2,
+                    "chat": {"id": 888, "type": "private", "first_name": "test"},
+                    "text": "results 2"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let bot = Bot::new("token").set_api_url(server.uri().parse().unwrap());
+
+        let tmdb_server = MockServer::start().await;
+        let tmdb = TmdbClient::new_test("token".to_string(), tmdb_server.uri());
+
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path("/movie/999"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 999, "title": "Fallback Movie",
+                "original_title": "Fallback Movie", "overview": "", "poster_path": null, "release_date": "2003-03-03"
+            })))
+            .mount(&tmdb_server)
+            .await;
+
+        let storage_path = PathBuf::from("tests/data/tg_test_storage_fallback.json");
+        let _ = std::fs::remove_file(&storage_path);
+        let storage = Storage::new(storage_path.clone()).await.unwrap();
+
+        let _ = LAST_SEARCH.invalidate(&(ChatId(888), 99)).await;
+
+        let q1 = serde_json::from_value::<CallbackQuery>(serde_json::json!({
+            "id": "1", "from": {"id": 888, "is_bot": false, "first_name": "test"},
+            "chat_instance": "1", "data": "add:999:movie",
+            "message": {
+                "message_id": 99, "date": 1, "chat": {"id": 888, "type": "private"}, "text": "results 1"
+            }
+        })).unwrap();
+        on_callback(bot.clone(), q1, &tmdb, &storage).await.unwrap();
+
+        let stored = storage.get(888).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].title, "Fallback Movie");
+
+        let _ = std::fs::remove_file(storage_path);
+    }
 }
+
 fn keyboard_list_two_columns_stored(list: &[StoredMovie]) -> InlineKeyboardMarkup {
     let mut rows = Vec::new();
     for m in list {
